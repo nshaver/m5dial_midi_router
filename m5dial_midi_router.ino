@@ -4,28 +4,14 @@
 #include <vector>
 
 // ============================================================
-// BLE MIDI
+// BLE MIDI & HARDWARE CONFIG
 // ============================================================
 
 #define MIDI_SERVICE_UUID "03b80e5a-ede8-4b33-a751-6ce34ec4c700"
 
-// ============================================================
-// Hardware MIDI / SAM2695 Synth Port
-// ============================================================
-
 #define MIDI_PORTB_RX 1
 #define MIDI_PORTB_TX 2
 #define MIDI_BAUD 31250
-
-
-// ============================================================
-// Diagnostics
-// ============================================================
-
-#define DEBUG_RAW_BLE        0
-#define DEBUG_NOTE_MESSAGES  0
-#define DEBUG_PARSER_ERRORS  1
-#define DEBUG_TX_OVERFLOW    1
 
 // ============================================================
 // General MIDI Instrument Names
@@ -71,25 +57,13 @@ const GmInstrument gmInstruments[] = {
   {124, "Telephone Ring"}, {125, "Helicopter"}, {126, "Applause"}, {127, "Gunshot"}
 };
 const int totalGmInstruments = sizeof(gmInstruments) / sizeof(GmInstrument);
+
+// ============================================================
+// SYSTEM & ROUTING STATE
+// ============================================================
+
+uint8_t targetMidiChannel = 1; // 1 to 16
 int selectedSynthPatchIndex = 0;
-
-// ============================================================
-// MIDI TX Ring Buffer
-// ============================================================
-
-#define MIDI_TX_BUFFER_SIZE 2048
-
-uint8_t midiTxBuffer[MIDI_TX_BUFFER_SIZE];
-
-volatile size_t txHead = 0;
-volatile size_t txTail = 0;
-volatile uint32_t midiTxDropped = 0;
-
-portMUX_TYPE midiBufferMux = portMUX_INITIALIZER_UNLOCKED;
-
-// ============================================================
-// BLE / Application State
-// ============================================================
 
 enum AppState {
   STATE_IDLE,          
@@ -108,43 +82,64 @@ struct MidiDevice {
 };
 
 std::vector<MidiDevice> midiDeviceList;
-
 int selectedDeviceIndex = 0;
-long oldEncoderPosition = 0;
 
 NimBLEClient* pClient = nullptr;
 NimBLERemoteCharacteristic* pMidiChar = nullptr;
-
 bool isConnected = false;
-
-// ============================================================
-// BLE MIDI Parser State
-// ============================================================
-
 bool bleMidiInSysEx = false;
 
 // ============================================================
-// MIDI Activity Indicator State
+// MENU SYSTEM STATE
 // ============================================================
+
+enum MenuMode {
+  MENU_MAIN,
+  MENU_EDIT_CHANNEL,
+  MENU_EDIT_PATCH,
+  MENU_SELECT_DEVICE
+};
+
+MenuMode currentMenuMode = MENU_MAIN;
+int currentMenuItem = 0; // 0: BLE Control, 1: MIDI Out Ch, 2: Synth Patch
+const int totalMenuItems = 3;
+
+long oldEncoderPosition = 0;
+
+// ============================================================
+// MIDI TX RING BUFFER
+// ============================================================
+
+#define MIDI_TX_BUFFER_SIZE 2048
+uint8_t midiTxBuffer[MIDI_TX_BUFFER_SIZE];
+volatile size_t txHead = 0;
+volatile size_t txTail = 0;
+volatile uint32_t midiTxDropped = 0;
+portMUX_TYPE midiBufferMux = portMUX_INITIALIZER_UNLOCKED;
 
 unsigned long lastMidiActivityTime = 0;
 const unsigned long midiLedDurationMs = 40;
 bool midiLedState = false;
 
 // ============================================================
-// LVGL UI Widgets
+// LVGL WIDGET REFERENCES
 // ============================================================
 
-lv_obj_t* patchLabel = nullptr;
-lv_obj_t* bleLine1Label = nullptr;
-lv_obj_t* bleLine2Label = nullptr;
+// Top Status Half
+lv_obj_t* statusBleLabel = nullptr;
+lv_obj_t* statusChanLabel = nullptr;
+lv_obj_t* statusPatchLabel = nullptr;
 lv_obj_t* midiIndicatorObj = nullptr;
-lv_obj_t* headerLabel = nullptr;
 
-// ============================================================
+// Bottom Menu Half
+lv_obj_t* menuItem0Obj = nullptr;
+lv_obj_t* menuItem0Label = nullptr;
+lv_obj_t* menuItem1Obj = nullptr;
+lv_obj_t* menuItem1Label = nullptr;
+lv_obj_t* menuItem2Obj = nullptr;
+lv_obj_t* menuItem2Label = nullptr;
+
 // Function Prototypes
-// ============================================================
-
 void connectToDevice(NimBLEAddress addr);
 void disconnectDevice();
 void updateUI();
@@ -159,7 +154,7 @@ void sendLocalSynthProgramChange(uint8_t program);
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p);
 
 // ============================================================
-// LVGL Display Flush Callback
+// LVGL FLUSH & HARDWARE MIDI
 // ============================================================
 
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
@@ -174,27 +169,18 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
   lv_disp_flush_ready(disp);
 }
 
-// ============================================================
-// Local SAM2695 Direct Control
-// ============================================================
-
 void sendLocalSynthProgramChange(uint8_t program) {
-  Serial2.write(0xC0); // Program Change on Channel 1
+  uint8_t status = 0xC0 | ((targetMidiChannel - 1) & 0x0F);
+  Serial2.write(status);
   Serial2.write(program);
-  Serial.printf("[Synth] Local Program Change sent: PC %u (%s)\n", 
-                program, gmInstruments[selectedSynthPatchIndex].name);
+  Serial.printf("[Synth] Program Change sent on Ch %u: PC %u (%s)\n", 
+                targetMidiChannel, program, gmInstruments[selectedSynthPatchIndex].name);
 }
-
-// ============================================================
-// MIDI TX BUFFER
-// ============================================================
 
 bool queueMidiByte(uint8_t b) {
   bool queued = false;
-
   portENTER_CRITICAL(&midiBufferMux);
   size_t nextHead = (txHead + 1) % MIDI_TX_BUFFER_SIZE;
-
   if (nextHead != txTail) {
     midiTxBuffer[txHead] = b;
     txHead = nextHead;
@@ -203,7 +189,6 @@ bool queueMidiByte(uint8_t b) {
     midiTxDropped++;
   }
   portEXIT_CRITICAL(&midiBufferMux);
-
   return queued;
 }
 
@@ -216,16 +201,13 @@ void clearMidiTxBuffer() {
 
 void processMidiTxBuffer() {
   while (true) {
-    size_t tail;
-    size_t head;
-
+    size_t tail, head;
     portENTER_CRITICAL(&midiBufferMux);
     tail = txTail;
     head = txHead;
     portEXIT_CRITICAL(&midiBufferMux);
 
-    if (tail == head) break;
-    if (Serial2.availableForWrite() <= 0) break;
+    if (tail == head || Serial2.availableForWrite() <= 0) break;
 
     uint8_t b;
     portENTER_CRITICAL(&midiBufferMux);
@@ -242,6 +224,11 @@ void processMidiTxBuffer() {
 }
 
 void queueMidiMessage(uint8_t status, const uint8_t* data, int dataLen) {
+  // Remap Channel Messages (0x80 - 0xEF) to targetMidiChannel
+  if (status >= 0x80 && status < 0xF0) {
+    status = (status & 0xF0) | ((targetMidiChannel - 1) & 0x0F);
+  }
+
   queueMidiByte(status);
   for (int i = 0; i < dataLen; i++) {
     queueMidiByte(data[i]);
@@ -255,23 +242,21 @@ void queueMidiMessage(uint8_t status, const uint8_t* data, int dataLen) {
 }
 
 void updateMidiActivityIndicator() {
-  if (!isConnected || !midiIndicatorObj) return;
-
-  if (midiLedState) {
+  if (!midiIndicatorObj) return;
+  if (midiLedState && isConnected) {
     lv_obj_set_style_bg_color(midiIndicatorObj, lv_color_hex(0x00FF00), 0);
   } else {
-    lv_obj_set_style_bg_color(midiIndicatorObj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_color(midiIndicatorObj, lv_color_hex(0x222222), 0);
   }
 }
 
 // ============================================================
-// BLE PARSER & CALLBACKS
+// BLE MIDI PARSER & CALLBACKS
 // ============================================================
 
 void parseBleMidiPacket(uint8_t* pData, size_t length) {
   if (length < 2) return;
-  uint8_t header = pData[0];
-  if ((header & 0x80) == 0) return;
+  if ((pData[0] & 0x80) == 0) return;
 
   uint8_t runningStatus = 0;
   size_t i = 1;
@@ -292,17 +277,15 @@ void parseBleMidiPacket(uint8_t* pData, size_t length) {
     if ((pData[i] & 0x80) != 0) { i++; }
     if (i >= length) break;
 
-    while (i < length && pData[i] >= 0xF8) {
-      queueMidiByte(pData[i++]);
-    }
+    while (i < length && pData[i] >= 0xF8) queueMidiByte(pData[i++]);
     if (i >= length) break;
 
     uint8_t b = pData[i];
     if (b & 0x80) {
       runningStatus = b;
       i++;
-    } else {
-      if (runningStatus == 0) { i++; continue; }
+    } else if (runningStatus == 0) {
+      i++; continue;
     }
 
     if (runningStatus >= 0xF8) {
@@ -314,20 +297,11 @@ void parseBleMidiPacket(uint8_t* pData, size_t length) {
     uint8_t statusType = runningStatus & 0xF0;
     int dataLen = 0;
 
-    if (statusType == 0x80 || statusType == 0x90 || statusType == 0xA0 || statusType == 0xB0 || statusType == 0xE0) {
-      dataLen = 2;
-    } else if (statusType == 0xC0 || statusType == 0xD0) {
-      dataLen = 1;
-    } else if (runningStatus == 0xF1 || runningStatus == 0xF3) {
-      dataLen = 1;
-    } else if (runningStatus == 0xF2) {
-      dataLen = 2;
-    } else if (runningStatus == 0xF6) {
-      dataLen = 0;
-    } else {
-      runningStatus = 0;
-      continue;
-    }
+    if (statusType == 0x80 || statusType == 0x90 || statusType == 0xA0 || statusType == 0xB0 || statusType == 0xE0) dataLen = 2;
+    else if (statusType == 0xC0 || statusType == 0xD0 || runningStatus == 0xF1 || runningStatus == 0xF3) dataLen = 1;
+    else if (runningStatus == 0xF2) dataLen = 2;
+    else if (runningStatus == 0xF6) dataLen = 0;
+    else { runningStatus = 0; continue; }
 
     if (i + dataLen > length) break;
 
@@ -344,8 +318,7 @@ void parseBleMidiPacket(uint8_t* pData, size_t length) {
 }
 
 void midiNotifyCallback(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
-  if (!isNotify || !pData || length == 0) return;
-  parseBleMidiPacket(pData, length);
+  if (isNotify && pData && length > 0) parseBleMidiPacket(pData, length);
 }
 
 class MidiClientCallbacks : public NimBLEClientCallbacks {
@@ -359,6 +332,7 @@ class MidiClientCallbacks : public NimBLEClientCallbacks {
     bleMidiInSysEx = false;
     clearMidiTxBuffer();
     currentState = STATE_IDLE;
+    currentMenuMode = MENU_MAIN;
     requestUiUpdate = true;
   }
   void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {}
@@ -405,6 +379,8 @@ void startScan() {
   midiDeviceList.clear();
   selectedDeviceIndex = 0;
   pScan->start(5, false, false);
+  currentState = STATE_SCANNING;
+  currentMenuMode = MENU_SELECT_DEVICE;
   updateUI();
 }
 
@@ -419,8 +395,6 @@ void connectToDevice(NimBLEAddress addr) {
 
   currentState = STATE_CONNECTING;
   updateUI();
-
-  // Force LVGL to render the "Connecting" frame immediately before blocking operations
   lv_timer_handler();
 
   if (!pClient->connect(addr, true)) {
@@ -455,8 +429,7 @@ void connectToDevice(NimBLEAddress addr) {
   }
 
   pMidiChar = nullptr;
-  const std::vector<NimBLERemoteCharacteristic*>& pChars = pService->getCharacteristics(true);
-  for (auto pCh : pChars) {
+  for (auto pCh : pService->getCharacteristics(true)) {
     if (pCh->canNotify()) {
       pMidiChar = pCh;
       break;
@@ -474,6 +447,7 @@ void connectToDevice(NimBLEAddress addr) {
   clearMidiTxBuffer();
   isConnected = true;
   currentState = STATE_CONNECTED;
+  currentMenuMode = MENU_MAIN;
   updateUI();
 }
 
@@ -487,123 +461,153 @@ void disconnectDevice() {
   bleMidiInSysEx = false;
   clearMidiTxBuffer();
   currentState = STATE_IDLE;
+  currentMenuMode = MENU_MAIN;
   updateUI();
 }
 
 // ============================================================
-// UI Layout & Updates (LVGL)
+// UI LAYOUT & STATUS / MENU SYSTEM (LVGL)
 // ============================================================
 
 void setupUI() {
   lv_obj_t* scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
 
-  // Top Title Label
-  headerLabel = lv_label_create(scr);
-  lv_label_set_text(headerLabel, "MIDI Router");
-  lv_obj_set_style_text_color(headerLabel, lv_color_hex(0x00FFFF), 0);
-  lv_obj_set_style_text_font(headerLabel, &lv_font_montserrat_14, 0);
-  lv_obj_align(headerLabel, LV_ALIGN_TOP_MID, 0, 15);
+  // ----------------------------------------------------------
+  // Top 1/2: Status Display Panel (Y: 0 to 119)
+  // ----------------------------------------------------------
+  statusBleLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(statusBleLabel, &lv_font_montserrat_14, 0);
+  lv_obj_align(statusBleLabel, LV_ALIGN_TOP_MID, 0, 15);
 
-  // Center Patch Label
-  patchLabel = lv_label_create(scr);
-  lv_obj_set_style_text_color(patchLabel, lv_color_hex(0xFF00FF), 0);
-  lv_obj_set_style_text_font(patchLabel, &lv_font_montserrat_14, 0);
-  lv_obj_align(patchLabel, LV_ALIGN_CENTER, 0, -5);
+  statusChanLabel = lv_label_create(scr);
+  lv_obj_set_style_text_color(statusChanLabel, lv_color_hex(0x00FFFF), 0);
+  lv_obj_set_style_text_font(statusChanLabel, &lv_font_montserrat_14, 0);
+  lv_obj_align(statusChanLabel, LV_ALIGN_TOP_MID, 0, 40);
 
-  // Divider line separating upper patch area and bottom 1/3 BLE zone
+  statusPatchLabel = lv_label_create(scr);
+  lv_obj_set_style_text_color(statusPatchLabel, lv_color_hex(0xFF00FF), 0);
+  lv_obj_set_style_text_font(statusPatchLabel, &lv_font_montserrat_14, 0);
+  lv_obj_align(statusPatchLabel, LV_ALIGN_TOP_MID, 0, 65);
+
+  // MIDI activity indicator bar
+  midiIndicatorObj = lv_obj_create(scr);
+  lv_obj_set_size(midiIndicatorObj, 140, 6);
+  lv_obj_align(midiIndicatorObj, LV_ALIGN_TOP_MID, 0, 95);
+  lv_obj_set_style_bg_color(midiIndicatorObj, lv_color_hex(0x222222), 0);
+  lv_obj_set_style_border_width(midiIndicatorObj, 0, 0);
+  lv_obj_set_style_radius(midiIndicatorObj, 2, 0);
+
+  // Center Divider Line
   lv_obj_t* line = lv_line_create(scr);
-  static lv_point_t line_points[] = {{40, 150}, {200, 150}};
-  lv_obj_set_style_line_color(line, lv_color_hex(0x555555), 0);
+  static lv_point_t line_points[] = {{10, 108}, {230, 108}};
+  lv_obj_set_style_line_color(line, lv_color_hex(0x444444), 0);
   lv_obj_set_style_line_width(line, 2, 0);
   lv_line_set_points(line, line_points, 2);
 
-  // Bottom 1/3 BLE Line 1
-  bleLine1Label = lv_label_create(scr);
-  lv_obj_set_style_text_font(bleLine1Label, &lv_font_montserrat_14, 0);
-  lv_obj_align(bleLine1Label, LV_ALIGN_TOP_MID, 0, 162);
+  // ----------------------------------------------------------
+  // Bottom 1/2: Menu System Panel (Y: 110 to 240)
+  // ----------------------------------------------------------
+  menuItem0Obj = lv_obj_create(scr);
+  lv_obj_set_size(menuItem0Obj, 210, 32);
+  lv_obj_align(menuItem0Obj, LV_ALIGN_TOP_MID, 0, 115);
+  lv_obj_set_style_radius(menuItem0Obj, 4, 0);
+  menuItem0Label = lv_label_create(menuItem0Obj);
+  lv_obj_set_style_text_font(menuItem0Label, &lv_font_montserrat_14, 0);
+  lv_obj_center(menuItem0Label);
 
-  // Bottom 1/3 BLE Line 2
-  bleLine2Label = lv_label_create(scr);
-  lv_obj_set_style_text_font(bleLine2Label, &lv_font_montserrat_14, 0);
-  lv_obj_align(bleLine2Label, LV_ALIGN_TOP_MID, 0, 188);
+  menuItem1Obj = lv_obj_create(scr);
+  lv_obj_set_size(menuItem1Obj, 210, 32);
+  lv_obj_align(menuItem1Obj, LV_ALIGN_TOP_MID, 0, 152);
+  lv_obj_set_style_radius(menuItem1Obj, 4, 0);
+  menuItem1Label = lv_label_create(menuItem1Obj);
+  lv_obj_set_style_text_font(menuItem1Label, &lv_font_montserrat_14, 0);
+  lv_obj_center(menuItem1Label);
 
-  // MIDI activity indicator dot/bar
-  midiIndicatorObj = lv_obj_create(scr);
-  lv_obj_set_size(midiIndicatorObj, 120, 10);
-  lv_obj_align(midiIndicatorObj, LV_ALIGN_TOP_MID, 0, 216);
-  lv_obj_set_style_bg_color(midiIndicatorObj, lv_color_hex(0x000000), 0);
-  lv_obj_set_style_border_width(midiIndicatorObj, 0, 0);
-  lv_obj_set_style_radius(midiIndicatorObj, 3, 0);
+  menuItem2Obj = lv_obj_create(scr);
+  lv_obj_set_size(menuItem2Obj, 210, 32);
+  lv_obj_align(menuItem2Obj, LV_ALIGN_TOP_MID, 0, 189);
+  lv_obj_set_style_radius(menuItem2Obj, 4, 0);
+  menuItem2Label = lv_label_create(menuItem2Obj);
+  lv_obj_set_style_text_font(menuItem2Label, &lv_font_montserrat_14, 0);
+  lv_obj_center(menuItem2Label);
 
   updateUI();
 }
 
+void setMenuItemStyle(lv_obj_t* container, lv_obj_t* label, bool isSelected, bool isEditing, const char* text) {
+  lv_label_set_text(label, text);
+  lv_obj_center(label);
+
+  if (isEditing) {
+    lv_obj_set_style_bg_color(container, lv_color_hex(0xFF9900), 0); // Orange highlight when active editing
+    lv_obj_set_style_text_color(label, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_border_color(container, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_width(container, 2, 0);
+  } else if (isSelected) {
+    lv_obj_set_style_bg_color(container, lv_color_hex(0x0066CC), 0); // Blue focus highlight
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_width(container, 0, 0);
+  } else {
+    lv_obj_set_style_bg_color(container, lv_color_hex(0x181818), 0); // Inactive dark item background
+    lv_obj_set_style_text_color(label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_border_width(container, 0, 0);
+  }
+}
+
 void updateUI() {
-  if (!patchLabel) return;
+  if (!statusBleLabel) return;
 
-  // Update Patch Info
-  String patchInfo = String(gmInstruments[selectedSynthPatchIndex].programNumber) + ": " + gmInstruments[selectedSynthPatchIndex].name;
-  lv_label_set_text(patchLabel, patchInfo.c_str());
-  lv_obj_align(patchLabel, LV_ALIGN_CENTER, 0, -5);
-
-  // Update Bottom BLE Section
+  // 1. Refresh Top Status
   if (currentState == STATE_IDLE) {
-    lv_obj_set_style_text_color(bleLine1Label, lv_color_hex(0xFF0000), 0);
-    lv_label_set_text(bleLine1Label, "BLE: Unconnected");
-    lv_obj_align(bleLine1Label, LV_ALIGN_TOP_MID, 0, 162);
-
-    lv_obj_set_style_text_color(bleLine2Label, lv_color_hex(0xFFFF00), 0);
-    lv_label_set_text(bleLine2Label, "Touch to Scan");
-    lv_obj_align(bleLine2Label, LV_ALIGN_TOP_MID, 0, 188);
-
-    lv_obj_set_style_bg_color(midiIndicatorObj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_text_color(statusBleLabel, lv_color_hex(0xFF4444), 0);
+    lv_label_set_text(statusBleLabel, "BLE: Disconnected");
+  } else if (currentState == STATE_SCANNING) {
+    lv_obj_set_style_text_color(statusBleLabel, lv_color_hex(0xFFFF00), 0);
+    lv_label_set_text(statusBleLabel, "BLE: Scanning...");
+  } else if (currentState == STATE_CONNECTING) {
+    lv_obj_set_style_text_color(statusBleLabel, lv_color_hex(0x00FFFF), 0);
+    lv_label_set_text(statusBleLabel, "BLE: Connecting...");
+  } else if (currentState == STATE_CONNECTED) {
+    String devName = midiDeviceList.empty() ? "Device" : midiDeviceList[selectedDeviceIndex].name;
+    if (devName.length() > 14) devName = devName.substring(0, 12) + "..";
+    lv_obj_set_style_text_color(statusBleLabel, lv_color_hex(0x00FF00), 0);
+    lv_label_set_text(statusBleLabel, ("BLE: " + devName).c_str());
   }
-  else if (currentState == STATE_SCANNING) {
+  lv_obj_align(statusBleLabel, LV_ALIGN_TOP_MID, 0, 15);
+
+  lv_label_set_text(statusChanLabel, ("MIDI Out Ch: " + String(targetMidiChannel)).c_str());
+  lv_obj_align(statusChanLabel, LV_ALIGN_TOP_MID, 0, 40);
+
+  String patchText = String(gmInstruments[selectedSynthPatchIndex].programNumber) + ": " + gmInstruments[selectedSynthPatchIndex].name;
+  if (patchText.length() > 22) patchText = patchText.substring(0, 20) + "..";
+  lv_label_set_text(statusPatchLabel, patchText.c_str());
+  lv_obj_align(statusPatchLabel, LV_ALIGN_TOP_MID, 0, 65);
+
+  // 2. Refresh Bottom Menu
+  if (currentMenuMode == MENU_SELECT_DEVICE) {
+    // Menu item 0 becomes device navigator during scanning
     if (midiDeviceList.empty()) {
-      lv_obj_set_style_text_color(bleLine1Label, lv_color_hex(0xFFFF00), 0);
-      lv_label_set_text(bleLine1Label, "SCANNING...");
-      lv_obj_align(bleLine1Label, LV_ALIGN_TOP_MID, 0, 162);
-
-      lv_obj_set_style_text_color(bleLine2Label, lv_color_hex(0xFFFFFF), 0);
-      lv_label_set_text(bleLine2Label, "Searching...");
-      lv_obj_align(bleLine2Label, LV_ALIGN_TOP_MID, 0, 188);
+      setMenuItemStyle(menuItem0Obj, menuItem0Label, true, false, "Searching...");
     } else {
-      lv_obj_set_style_text_color(bleLine1Label, lv_color_hex(0xFFFFFF), 0);
-      lv_label_set_text(bleLine1Label, ("Found: " + String((int)midiDeviceList.size()) + " devices").c_str());
-      lv_obj_align(bleLine1Label, LV_ALIGN_TOP_MID, 0, 158);
-
-      String displayName = midiDeviceList[selectedDeviceIndex].name;
-      if (displayName.length() > 14) displayName = displayName.substring(0, 12) + "..";
-      lv_obj_set_style_text_color(bleLine2Label, lv_color_hex(0x00FF00), 0);
-      lv_label_set_text(bleLine2Label, displayName.c_str());
-      lv_obj_align(bleLine2Label, LV_ALIGN_TOP_MID, 0, 182);
+      String dName = midiDeviceList[selectedDeviceIndex].name;
+      if (dName.length() > 16) dName = dName.substring(0, 14) + "..";
+      setMenuItemStyle(menuItem0Obj, menuItem0Label, true, false, ("> " + dName).c_str());
     }
+    setMenuItemStyle(menuItem1Obj, menuItem1Label, false, false, "Cancel Scan");
+    setMenuItemStyle(menuItem2Obj, menuItem2Label, false, false, "");
+    return;
   }
-  else if (currentState == STATE_CONNECTING) {
-    lv_obj_set_style_text_color(bleLine1Label, lv_color_hex(0x00FFFF), 0);
-    lv_label_set_text(bleLine1Label, "Connecting:");
-    lv_obj_align(bleLine1Label, LV_ALIGN_TOP_MID, 0, 162);
 
-    String targetName = midiDeviceList[selectedDeviceIndex].name;
-    if (targetName.length() > 14) targetName = targetName.substring(0, 12) + "..";
-    lv_obj_set_style_text_color(bleLine2Label, lv_color_hex(0x00FF00), 0);
-    lv_label_set_text(bleLine2Label, targetName.c_str());
-    lv_obj_align(bleLine2Label, LV_ALIGN_TOP_MID, 0, 188);
-  }
-  else if (currentState == STATE_CONNECTED) {
-    lv_obj_set_style_text_color(bleLine1Label, lv_color_hex(0x00FF00), 0);
-    lv_label_set_text(bleLine1Label, "Connected");
-    lv_obj_align(bleLine1Label, LV_ALIGN_TOP_MID, 0, 162);
+  // General Main Menu Render
+  const char* bleActionStr = isConnected ? "Disconnect BLE" : "Scan BLE MIDI";
+  setMenuItemStyle(menuItem0Obj, menuItem0Label, (currentMenuItem == 0), false, bleActionStr);
 
-    String activeName = midiDeviceList[selectedDeviceIndex].name;
-    if (activeName.length() > 16) activeName = activeName.substring(0, 14) + "..";
-    lv_obj_set_style_text_color(bleLine2Label, lv_color_hex(0xFFFFFF), 0);
-    lv_label_set_text(bleLine2Label, activeName.c_str());
-    lv_obj_align(bleLine2Label, LV_ALIGN_TOP_MID, 0, 188);
+  String chMenuStr = "MIDI Out Ch: < " + String(targetMidiChannel) + " >";
+  setMenuItemStyle(menuItem1Obj, menuItem1Label, (currentMenuItem == 1), (currentMenuMode == MENU_EDIT_CHANNEL), chMenuStr.c_str());
 
-    updateMidiActivityIndicator();
-  }
+  String pMenuStr = "Patch: < " + String(gmInstruments[selectedSynthPatchIndex].programNumber) + " >";
+  setMenuItemStyle(menuItem2Obj, menuItem2Label, (currentMenuItem == 2), (currentMenuMode == MENU_EDIT_PATCH), pMenuStr.c_str());
 }
 
 // ============================================================
@@ -611,7 +615,6 @@ void updateUI() {
 // ============================================================
 
 void setup() {
-  // Latch power ON immediately via GPIO 46 to hold power when waking from button press
   pinMode(46, OUTPUT);
   digitalWrite(46, HIGH);
 
@@ -625,7 +628,6 @@ void setup() {
   Serial2.begin(MIDI_BAUD, SERIAL_8N1, MIDI_PORTB_RX, MIDI_PORTB_TX);
   Serial.println("[MIDI] SAM2695 synth port initialized at 31250 baud.");
 
-  // Initialize LVGL
   lv_init();
 
   static lv_color_t buf[240 * 40];
@@ -659,20 +661,34 @@ void setup() {
 }
 
 // ============================================================
-// LOOP
+// MAIN LOOP & NAVIGATION
 // ============================================================
+
+void triggerMenuAction(int item) {
+  if (item == 0) { // BLE Action
+    if (isConnected) {
+      disconnectDevice();
+    } else {
+      startScan();
+    }
+  } else if (item == 1) { // Edit Out Channel
+    currentMenuMode = (currentMenuMode == MENU_EDIT_CHANNEL) ? MENU_MAIN : MENU_EDIT_CHANNEL;
+    updateUI();
+  } else if (item == 2) { // Edit Program Change
+    currentMenuMode = (currentMenuMode == MENU_EDIT_PATCH) ? MENU_MAIN : MENU_EDIT_PATCH;
+    updateUI();
+  }
+}
 
 void loop() {
   M5Dial.update();
 
-  // Feed elapsed time to LVGL so it can process rendering/timers
   static uint32_t last_tick = 0;
   uint32_t current_tick = millis();
   lv_tick_inc(current_tick - last_tick);
   last_tick = current_tick;
 
-  lv_timer_handler(); // Let LVGL render UI frames
-
+  lv_timer_handler();
   processMidiTxBuffer();
 
   if (requestUiUpdate) {
@@ -685,9 +701,7 @@ void loop() {
     updateMidiActivityIndicator();
   }
 
-  // ==========================================================
-  // Long Press Button Handler for Power Off
-  // ==========================================================
+  // Long press button to turn off power
   static unsigned long btnPressStartTime = 0;
   static bool isHolding = false;
 
@@ -695,67 +709,89 @@ void loop() {
     if (!isHolding) {
       isHolding = true;
       btnPressStartTime = millis();
-    } else {
-      // Check if held for x seconds
-      if (millis() - btnPressStartTime >= 5000) {
-        Serial.println("[Power] 5-second button hold detected. Shutting down...");
-        
-        // Visual cue on screen before dying
-        lv_label_set_text(patchLabel, "SHUTTING DOWN");
-        lv_obj_set_style_text_color(patchLabel, lv_color_hex(0xFF0000), 0);
-        lv_timer_handler();
-        delay(500);
-
-        // Cut power via M5 Power management API
-        M5.Power.powerOff();
-      }
+    } else if (millis() - btnPressStartTime >= 5000) {
+      Serial.println("[Power] 5-second button hold detected. Shutting down...");
+      M5.Power.powerOff();
     }
   } else {
-    if (isHolding) {
-      isHolding = false; // Reset if released before x seconds
-    }
+    isHolding = false;
   }
 
-  // Encoder Handling: Always controls SAM2695 Patch Selection unless scanning
+  // ----------------------------------------------------------
+  // Encoder Input Processing
+  // ----------------------------------------------------------
   long newPos = M5Dial.Encoder.read() / 4;
 
   if (newPos != oldEncoderPosition) {
-    if (currentState == STATE_SCANNING && !midiDeviceList.empty()) {
-      if (newPos > oldEncoderPosition) {
-        selectedDeviceIndex = (selectedDeviceIndex + 1) % midiDeviceList.size();
-      } else {
-        selectedDeviceIndex = (selectedDeviceIndex - 1 + midiDeviceList.size()) % midiDeviceList.size();
-      }
+    bool increment = (newPos > oldEncoderPosition);
+
+    if (currentMenuMode == MENU_MAIN) {
+      // Navigate Menu Items
+      if (increment) currentMenuItem = (currentMenuItem + 1) % totalMenuItems;
+      else currentMenuItem = (currentMenuItem - 1 + totalMenuItems) % totalMenuItems;
       updateUI();
-    } else {
-      if (newPos > oldEncoderPosition) {
-        selectedSynthPatchIndex = (selectedSynthPatchIndex + 1) % totalGmInstruments;
-      } else {
-        selectedSynthPatchIndex = (selectedSynthPatchIndex - 1 + totalGmInstruments) % totalGmInstruments;
-      }
+    } 
+    else if (currentMenuMode == MENU_EDIT_CHANNEL) {
+      // Modify Target Channel
+      if (increment) targetMidiChannel = (targetMidiChannel % 16) + 1;
+      else targetMidiChannel = (targetMidiChannel == 1) ? 16 : targetMidiChannel - 1;
       sendLocalSynthProgramChange(gmInstruments[selectedSynthPatchIndex].programNumber);
       updateUI();
+    } 
+    else if (currentMenuMode == MENU_EDIT_PATCH) {
+      // Modify Synth Patch
+      if (increment) selectedSynthPatchIndex = (selectedSynthPatchIndex + 1) % totalGmInstruments;
+      else selectedSynthPatchIndex = (selectedSynthPatchIndex - 1 + totalGmInstruments) % totalGmInstruments;
+      sendLocalSynthProgramChange(gmInstruments[selectedSynthPatchIndex].programNumber);
+      updateUI();
+    } 
+    else if (currentMenuMode == MENU_SELECT_DEVICE && !midiDeviceList.empty()) {
+      // Navigate Scanned Devices
+      if (increment) selectedDeviceIndex = (selectedDeviceIndex + 1) % midiDeviceList.size();
+      else selectedDeviceIndex = (selectedDeviceIndex - 1 + midiDeviceList.size()) % midiDeviceList.size();
+      updateUI();
     }
+
     oldEncoderPosition = newPos;
   }
 
-  // Native Touch Actions (Bottom 1/3 Region = BLE Control) & Button Fallback
+  // ----------------------------------------------------------
+  // Touch & Center Button Input Processing
+  // ----------------------------------------------------------
   auto touch = M5.Touch.getDetail();
-  bool touchBottom = touch.wasPressed() && (touch.y >= 150);
-  bool btnTriggered = M5Dial.BtnA.wasClicked();
+  bool touchMenuRegion = touch.wasPressed() && (touch.y >= 108);
+  bool btnClicked = M5Dial.BtnA.wasClicked();
 
-  if (touchBottom || btnTriggered) {
-    if (currentState == STATE_IDLE) {
-      currentState = STATE_SCANNING;
-      startScan();
+  if (btnClicked) {
+    if (currentMenuMode == MENU_SELECT_DEVICE) {
+      if (!midiDeviceList.empty()) {
+        connectToDevice(midiDeviceList[selectedDeviceIndex].address);
+      } else {
+        disconnectDevice();
+      }
+    } else {
+      triggerMenuAction(currentMenuItem);
     }
-    else if (currentState == STATE_SCANNING && !midiDeviceList.empty()) {
-      currentState = STATE_CONNECTING;
-      updateUI();
-      connectToDevice(midiDeviceList[selectedDeviceIndex].address);
-    }
-    else if (currentState == STATE_CONNECTED) {
-      disconnectDevice();
+  } 
+  else if (touchMenuRegion) {
+    if (currentMenuMode == MENU_SELECT_DEVICE) {
+      if (touch.y < 150 && !midiDeviceList.empty()) {
+        connectToDevice(midiDeviceList[selectedDeviceIndex].address);
+      } else if (touch.y >= 150) {
+        disconnectDevice();
+      }
+    } else {
+      // Touch mapping for menu items in lower half
+      if (touch.y < 148) {
+        currentMenuItem = 0;
+        triggerMenuAction(0);
+      } else if (touch.y >= 148 && touch.y < 185) {
+        currentMenuItem = 1;
+        triggerMenuAction(1);
+      } else if (touch.y >= 185) {
+        currentMenuItem = 2;
+        triggerMenuAction(2);
+      }
     }
   }
 
